@@ -26,8 +26,6 @@ function ENT:Initialize()
 	self.CenterPos    = self:GetVar("CenterPos",    self:GetPos())
 	self.CallDir      = self:GetVar("CallDir",      Vector(1,0,0))
 	self.Lifetime     = self:GetVar("Lifetime",     40)
-	self.Speed        = self:GetVar("Speed",        250)
-	self.OrbitRadius  = self:GetVar("OrbitRadius",  2500)
 	self.SkyHeightAdd = self:GetVar("SkyHeightAdd", 2500)
 
 	self.DIVE_ExplosionDamage = self:GetVar("DIVE_ExplosionDamage", 80)
@@ -42,12 +40,27 @@ function ENT:Initialize()
 	local ground = self:FindGround(self.CenterPos)
 	if ground == -1 then self:Debug("FindGround failed") self:Remove() return end
 
-	self.sky       = ground + self.SkyHeightAdd
+	local altVariance = self.SkyHeightAdd * 0.25
+	self.sky = ground + self.SkyHeightAdd + math.Rand(-altVariance, altVariance)
+
 	self.DieTime   = CurTime() + self.Lifetime
 	self.SpawnTime = CurTime()
 
-	local spawnPos = self.CenterPos - self.CallDir * 2000
-	spawnPos = Vector(spawnPos.x, spawnPos.y, self.sky)
+	local baseRadius = self:GetVar("OrbitRadius", 2500)
+	local baseSpeed  = self:GetVar("Speed",        250)
+	self.OrbitRadius = baseRadius * math.Rand(0.82, 1.18)
+	self.Speed       = baseSpeed  * math.Rand(0.85, 1.15)
+
+	self.OrbitDir = (math.random(0, 1) == 0) and 1 or -1
+
+	self.OrbitAngle    = math.Rand(0, math.pi * 2)
+	self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
+
+	local entryRad    = self.OrbitAngle
+	local entryOffset = Vector(math.cos(entryRad), math.sin(entryRad), 0)
+	local spawnPos    = self.CenterPos + entryOffset * (self.OrbitRadius * 1.05)
+	spawnPos.z        = self.sky
+
 	if not util.IsInWorld(spawnPos) then
 		spawnPos = Vector(self.CenterPos.x, self.CenterPos.y, self.sky)
 	end
@@ -68,22 +81,34 @@ function ENT:Initialize()
 	self:SetNWInt("HP",    self.MaxHP)
 	self:SetNWInt("MaxHP", self.MaxHP)
 
-	local ang = self.CallDir:Angle()
-	self:SetAngles(Angle(0, ang.y + 70, 0))
+	local tangent = Vector(-entryOffset.y, entryOffset.x, 0) * self.OrbitDir
+	local startAng = tangent:Angle()
+	self:SetAngles(Angle(0, startAng.y, 0))
 	self.ang = self:GetAngles()
 
 	self.SmoothedRoll  = 0
 	self.SmoothedPitch = 0
 	self.PrevYaw       = self:GetAngles().y
 
-	self.JitterPhase     = math.Rand(0, math.pi * 2)
-	self.JitterAmplitude = 28
+	self.JitterPhase  = math.Rand(0, math.pi * 2)
+	self.JitterPhase2 = math.Rand(0, math.pi * 2)
+	self.JitterAmp1   = math.Rand(8,  18)
+	self.JitterAmp2   = math.Rand(20, 45)
+	self.JitterRate1  = math.Rand(0.030, 0.060)
+	self.JitterRate2  = math.Rand(0.007, 0.015)
 
 	self.AltDriftCurrent  = self.sky
 	self.AltDriftTarget   = self.sky
 	self.AltDriftNextPick = CurTime() + math.Rand(8, 20)
 	self.AltDriftRange    = 700
 	self.AltDriftLerp     = 0.003
+
+	self.BaseCenterPos = Vector(self.CenterPos.x, self.CenterPos.y, self.CenterPos.z)
+	self.WanderPhaseX  = math.Rand(0, math.pi * 2)
+	self.WanderPhaseY  = math.Rand(0, math.pi * 2)
+	self.WanderAmp     = math.Rand(60, 160)
+	self.WanderRateX   = math.Rand(0.004, 0.010)
+	self.WanderRateY   = math.Rand(0.003, 0.009)
 
 	self.PhysObj = self:GetPhysicsObject()
 	if IsValid(self.PhysObj) then
@@ -126,7 +151,7 @@ function ENT:Initialize()
 
 	self.DivePitchTelegraph = 0
 
-	self:Debug("Spawned at " .. tostring(spawnPos))
+	self:Debug("Spawned at " .. tostring(spawnPos) .. " OrbitDir=" .. self.OrbitDir)
 end
 
 -- ============================================================
@@ -197,16 +222,41 @@ function ENT:Think()
 end
 
 -- ============================================================
--- FLIGHT  (orbit — only runs when NOT diving)
+-- FLIGHT  (polar orbit — only runs when NOT diving)
 -- ============================================================
 
 function ENT:PhysicsUpdate(phys)
 	if not self.DieTime or not self.sky then return end
-
 	if self.Diving then return end
 	if CurTime() >= self.DieTime then self:Remove() return end
 
 	local pos = self:GetPos()
+	local dt  = FrameTime()
+	if dt <= 0 then dt = 0.01 end
+
+	self.WanderPhaseX = self.WanderPhaseX + self.WanderRateX
+	self.WanderPhaseY = self.WanderPhaseY + self.WanderRateY
+	self.CenterPos = Vector(
+		self.BaseCenterPos.x + math.sin(self.WanderPhaseX) * self.WanderAmp,
+		self.BaseCenterPos.y + math.sin(self.WanderPhaseY) * self.WanderAmp,
+		self.BaseCenterPos.z
+	)
+
+	self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
+	self.OrbitAngle = self.OrbitAngle + self.OrbitAngSpeed * dt
+
+	local desiredX = self.CenterPos.x + math.cos(self.OrbitAngle) * self.OrbitRadius
+	local desiredY = self.CenterPos.y + math.sin(self.OrbitAngle) * self.OrbitRadius
+
+	local tangentYaw    = math.deg(self.OrbitAngle) + 90 * self.OrbitDir
+	local yawError      = math.NormalizeAngle(tangentYaw - self.ang.y)
+	local yawCorrection = math.Clamp(yawError * 0.08, -0.6, 0.6)
+	self.ang = self.ang + Angle(0, yawCorrection, 0)
+
+	self.JitterPhase  = self.JitterPhase  + self.JitterRate1
+	self.JitterPhase2 = self.JitterPhase2 + self.JitterRate2
+	local jitter = math.sin(self.JitterPhase)  * self.JitterAmp1
+	             + math.sin(self.JitterPhase2) * self.JitterAmp2
 
 	if CurTime() >= self.AltDriftNextPick then
 		self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
@@ -214,51 +264,35 @@ function ENT:PhysicsUpdate(phys)
 	end
 	self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
 
-	self.JitterPhase = self.JitterPhase + 0.04
-	local jitter     = math.sin(self.JitterPhase) * self.JitterAmplitude
-
 	local liveAlt = self.AltDriftCurrent + jitter
+
+	local posErr = Vector(desiredX - pos.x, desiredY - pos.y, 0)
+	local vel    = self:GetForward() * self.Speed
+	if posErr:LengthSqr() > 400 then
+		vel = vel + posErr:GetNormalized() * 80
+	end
+
 	self:SetPos(Vector(pos.x, pos.y, liveAlt))
 
-	local flatPos    = Vector(pos.x, pos.y, 0)
-	local flatCenter = Vector(self.CenterPos.x, self.CenterPos.y, 0)
-	local dist       = flatPos:Distance(flatCenter)
+	local rawYawDelta = math.NormalizeAngle(self.ang.y - (self.PrevYaw or self.ang.y))
+	self.PrevYaw      = self.ang.y
 
-	local orbitYaw = 0
-	if dist > self.OrbitRadius and (self.TurnDelay or 0) < CurTime() then
-		orbitYaw       = 0.1
-		self.TurnDelay = CurTime() + 0.02
-	end
-
-	local trSkyCheck = util.QuickTrace(self:GetPos(), self:GetForward() * 3000, self)
-	local skyYaw = 0
-	if trSkyCheck.HitSky then
-		skyYaw = 0.3
-	end
-
-	self.ang = self.ang + Angle(0, orbitYaw + skyYaw, 0)
-
-	local currentYaw  = self.ang.y
-	local rawYawDelta = math.NormalizeAngle(currentYaw - (self.PrevYaw or currentYaw))
-	self.PrevYaw      = currentYaw
-
-	local targetRoll  = math.Clamp(rawYawDelta * -25, -25, 25)
+	local targetRoll  = math.Clamp(rawYawDelta * -25, -30, 30)
 	local rollLerp    = rawYawDelta ~= 0 and 0.15 or 0.05
 	self.SmoothedRoll = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
 
-	local vel          = IsValid(phys) and phys:GetVelocity() or Vector(0,0,0)
-	local forwardSpeed = vel:Dot(self:GetForward())
+	local physVel      = IsValid(phys) and phys:GetVelocity() or Vector(0,0,0)
+	local forwardSpeed = physVel:Dot(self:GetForward())
 	local speedRatio   = math.Clamp(forwardSpeed / self.Speed, 0, 1)
 	local targetPitch  = math.Clamp(speedRatio * 10, -15, 15)
 	self.SmoothedPitch = Lerp(0.04, self.SmoothedPitch, targetPitch)
 
 	self.ang.p = self.SmoothedPitch
 	self.ang.r = self.SmoothedRoll
-
 	self:SetAngles(self.ang)
 
 	if IsValid(phys) then
-		phys:SetVelocity(self:GetForward() * self.Speed)
+		phys:SetVelocity(vel)
 	end
 
 	if not self:IsInWorld() then
