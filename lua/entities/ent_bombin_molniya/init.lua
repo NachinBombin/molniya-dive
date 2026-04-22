@@ -3,17 +3,10 @@ AddCSLuaFile("shared.lua")
 include("shared.lua")
 
 -- ============================================================
--- SOUNDS
+-- ENGINE SOUND  (TB2 pattern — anchored to world, not entity)
 -- ============================================================
 
--- Molniya uses its own idle loop; no separate dist variant
-local ENGINE_LOOP_SOUND = "^sound/sw/molniya/molniya_idle1.wav"
-
--- Pass-by whooshes reuse generic sounds from other addons in the family
-local PASS_SOUNDS = {
-	"lvs_darklord/rotors/rotor_loop_close.wav",
-	"lvs_darklord/rotors/rotor_loop_dist.wav",
-}
+local ENGINE_LOOP_SOUND = "lfs/spitfire/rpm_2.wav"
 
 -- ============================================================
 -- TUNING
@@ -22,8 +15,8 @@ local PASS_SOUNDS = {
 ENT.WeaponWindow  = 8
 ENT.FadeDuration  = 2.0
 
-ENT.DIVE_Speed         = 1400   -- slower terminal velocity than siblings
-ENT.DIVE_TrackInterval = 0.5    -- lazy re-lock: updates target only every 0.5s
+ENT.DIVE_Speed         = 1400
+ENT.DIVE_TrackInterval = 0.5
 
 -- ============================================================
 -- INITIALIZE
@@ -79,16 +72,13 @@ function ENT:Initialize()
 	self:SetAngles(Angle(0, ang.y + 70, 0))
 	self.ang = self:GetAngles()
 
-	-- Roll & Pitch state
 	self.SmoothedRoll  = 0
 	self.SmoothedPitch = 0
 	self.PrevYaw       = self:GetAngles().y
 
-	-- Wind jitter (heavier than siblings)
 	self.JitterPhase     = math.Rand(0, math.pi * 2)
-	self.JitterAmplitude = 28  -- 28 vs 12 on TB-2; visibly wobbly in orbit too
+	self.JitterAmplitude = 28
 
-	-- Altitude drift
 	self.AltDriftCurrent  = self.sky
 	self.AltDriftTarget   = self.sky
 	self.AltDriftNextPick = CurTime() + math.Rand(8, 20)
@@ -101,16 +91,14 @@ function ENT:Initialize()
 		self.PhysObj:EnableGravity(false)
 	end
 
-	-- Single idle loop, no start sound
-	self.IdleLoop = CreateSound(self, ENGINE_LOOP_SOUND)
-	if self.IdleLoop then
-		self.IdleLoop:SetSoundLevel(120)
-		self.IdleLoop:ChangePitch(100, 0)
-		self.IdleLoop:ChangeVolume(1.0, 0.5)
-		self.IdleLoop:Play()
+	-- TB2 pattern: world-anchored, no falloff, no PASS_SOUNDS
+	self.EngineLoop = CreateSound(game.GetWorld(), ENGINE_LOOP_SOUND)
+	if self.EngineLoop then
+		self.EngineLoop:SetSoundLevel(0)
+		self.EngineLoop:ChangePitch(85, 0)
+		self.EngineLoop:ChangeVolume(0.4, 0)
+		self.EngineLoop:Play()
 	end
-
-	self.NextPassSound = CurTime() + math.Rand(5, 10)
 
 	-- Weapon state
 	self.CurrentWeapon   = nil
@@ -124,26 +112,19 @@ function ENT:Initialize()
 	self.DiveExploded  = false
 	self.DiveAimOffset = Vector(0,0,0)
 
-	-- -------------------------------------------------------
-	-- MOLNIYA-SPECIFIC WOBBLE: big amplitude, slow speed
-	-- Layer 1H: horizontal fish-tail
 	self.DiveWobblePhase = 0
-	self.DiveWobbleAmp   = 320  -- vs 180 on Lancet
-	self.DiveWobbleSpeed = 3.2  -- slower so the swings are wide
+	self.DiveWobbleAmp   = 320
+	self.DiveWobbleSpeed = 3.2
 
-	-- Layer 1V: vertical porpoise
 	self.DiveWobblePhaseV = math.Rand(0, math.pi * 2)
-	self.DiveWobbleAmpV   = 240  -- vs 130 on Lancet
+	self.DiveWobbleAmpV   = 240
 	self.DiveWobbleSpeedV = 2.4
 
-	-- Layer 2: sluggish speed surge — never really reaches full speed
 	self.DiveSpeedMin     = self.DIVE_Speed * 0.55
 	self.DiveSpeedCurrent = self.DIVE_Speed * 0.55
-	self.DiveSpeedLerp    = 0.006  -- vs 0.018; takes much longer to accelerate
+	self.DiveSpeedLerp    = 0.006
 
-	-- Layer 3: pre-dive pitch telegraph
 	self.DivePitchTelegraph = 0
-	-- -------------------------------------------------------
 
 	self:Debug("Spawned at " .. tostring(spawnPos))
 end
@@ -195,14 +176,6 @@ function ENT:Think()
 		self.PhysObj:Wake()
 	end
 
-	if ct >= self.NextPassSound then
-		sound.Play(
-			table.Random(PASS_SOUNDS),
-			self:GetPos(), 95, math.random(88, 96), 0.8
-		)
-		self.NextPassSound = ct + math.Rand(6, 12)
-	end
-
 	local age  = ct - self.SpawnTime
 	local left = self.DieTime - ct
 	local alpha = 255
@@ -235,21 +208,18 @@ function ENT:PhysicsUpdate(phys)
 
 	local pos = self:GetPos()
 
-	-- Altitude drift
 	if CurTime() >= self.AltDriftNextPick then
 		self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
 		self.AltDriftNextPick = CurTime() + math.Rand(10, 25)
 	end
 	self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
 
-	-- Heavier wind jitter
 	self.JitterPhase = self.JitterPhase + 0.04
 	local jitter     = math.sin(self.JitterPhase) * self.JitterAmplitude
 
 	local liveAlt = self.AltDriftCurrent + jitter
 	self:SetPos(Vector(pos.x, pos.y, liveAlt))
 
-	-- Orbit turn
 	local flatPos    = Vector(pos.x, pos.y, 0)
 	local flatCenter = Vector(self.CenterPos.x, self.CenterPos.y, 0)
 	local dist       = flatPos:Distance(flatCenter)
@@ -266,10 +236,8 @@ function ENT:PhysicsUpdate(phys)
 		skyYaw = 0.3
 	end
 
-	local totalYawDelta = orbitYaw + skyYaw
-	self.ang = self.ang + Angle(0, totalYawDelta, 0)
+	self.ang = self.ang + Angle(0, orbitYaw + skyYaw, 0)
 
-	-- ROLL — yaw-rate driven
 	local currentYaw  = self.ang.y
 	local rawYawDelta = math.NormalizeAngle(currentYaw - (self.PrevYaw or currentYaw))
 	self.PrevYaw      = currentYaw
@@ -278,7 +246,6 @@ function ENT:PhysicsUpdate(phys)
 	local rollLerp    = rawYawDelta ~= 0 and 0.15 or 0.05
 	self.SmoothedRoll = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
 
-	-- PITCH — forward-speed driven
 	local vel          = IsValid(phys) and phys:GetVelocity() or Vector(0,0,0)
 	local forwardSpeed = vel:Dot(self:GetForward())
 	local speedRatio   = math.Clamp(forwardSpeed / self.Speed, 0, 1)
@@ -381,14 +348,11 @@ function ENT:InitDive(ct)
 	self.DiveWobblePhaseV = math.Rand(0, math.pi * 2)
 	self.DiveSpeedCurrent = self.DiveSpeedMin
 
-	-- -------------------------------------------------------
-	-- Bad seeker: large fixed aim error baked at launch
 	self.DiveAimOffset = Vector(
-		math.Rand(-700, 700),  -- vs ±400 on Lancet, ±400 on Shahed
+		math.Rand(-700, 700),
 		math.Rand(-700, 700),
 		0
 	)
-	-- -------------------------------------------------------
 
 	self:SetCollisionGroup(COLLISION_GROUP_NONE)
 	self:SetSolid(SOLID_VPHYSICS)
@@ -403,17 +367,16 @@ end
 function ENT:UpdateDive(ct)
 	if self.DiveExploded then return end
 
-	-- Lazy seeker: only re-locks every 0.5s, with heavy jitter
 	if ct >= self.DiveNextTrack then
 		if IsValid(self.DiveTarget) and self.DiveTarget:Alive() then
 			local trackJitter = Vector(
-				math.Rand(-300, 300),  -- vs ±120 on siblings
+				math.Rand(-300, 300),
 				math.Rand(-300, 300),
 				0
 			)
 			self.DiveTargetPos = self.DiveTarget:GetPos() + trackJitter
 		end
-		self.DiveNextTrack = ct + self.DIVE_TrackInterval  -- 0.5s
+		self.DiveNextTrack = ct + self.DIVE_TrackInterval
 	end
 
 	if not self.DiveTargetPos then self:Remove() return end
@@ -430,25 +393,21 @@ function ENT:UpdateDive(ct)
 
 	dir:Normalize()
 
-	-- Sluggish speed surge (DiveSpeedLerp = 0.006)
 	self.DiveSpeedCurrent = Lerp(self.DiveSpeedLerp, self.DiveSpeedCurrent, self.DIVE_Speed)
 
 	local dt = FrameTime()
 
-	-- Heavy horizontal fish-tail
 	self.DiveWobblePhase = self.DiveWobblePhase + self.DiveWobbleSpeed * dt
 	local flatRight = Vector(-dir.y, dir.x, 0)
 	if flatRight:LengthSqr() < 0.01 then flatRight = Vector(1, 0, 0) end
 	flatRight:Normalize()
 
-	-- Heavy vertical porpoise
 	self.DiveWobblePhaseV = self.DiveWobblePhaseV + self.DiveWobbleSpeedV * dt
 	local worldUp = Vector(0, 0, 1)
 	local upPerp  = worldUp - dir * dir:Dot(worldUp)
 	if upPerp:LengthSqr() < 0.01 then upPerp = Vector(0, 1, 0) end
 	upPerp:Normalize()
 
-	-- Wobble tapers to zero inside 400 units
 	local wobbleScale = math.Clamp(dist / 400, 0, 1)
 
 	local wobbleVel =
@@ -489,7 +448,6 @@ function ENT:DiveExplode(pos)
 
 	self:Debug("DIVE: exploding at " .. tostring(pos))
 
-	-- Tiny single-layer pop — smallest in the family
 	local ed1 = EffectData()
 	ed1:SetOrigin(pos)
 	ed1:SetScale(1) ed1:SetMagnitude(1) ed1:SetRadius(150)
@@ -527,9 +485,14 @@ function ENT:FindGround(centerPos)
 end
 
 -- ============================================================
--- CLEANUP
+-- CLEANUP  (TB2 pattern — fade volume then stop)
 -- ============================================================
 
 function ENT:OnRemove()
-	if self.IdleLoop then self.IdleLoop:Stop() end
+	if self.EngineLoop then
+		self.EngineLoop:ChangeVolume(0, 0.5)
+		timer.Simple(0.6, function()
+			if self.EngineLoop then self.EngineLoop:Stop() end
+		end)
+	end
 end
