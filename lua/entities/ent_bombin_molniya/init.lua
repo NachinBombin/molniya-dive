@@ -191,12 +191,23 @@ function ENT:Initialize()
 	-- Damage tier (0=healthy, 1=light, 2=heavy, 3=dead)
 	self.DamageTier = 0
 
-	-- Skybox evasion state
-	-- SkyYawBias accumulates extra angular velocity when sky probes fire.
-	-- It decays each tick so normal orbit resumes once clear.
+	-- ----------------------------------------------------------------
+	-- EVASION STATE
+	-- Shared yaw bias accumulator used by BOTH sky and geometry probes.
+	-- The sky system pushes this when HitSky fires;
+	-- the obstacle system pushes this when HitWorld / prop fires.
+	-- Both decay through the same per-tick multiplier so the combined
+	-- response stays bounded and the two systems cooperate naturally.
+	-- ----------------------------------------------------------------
 	self.SkyYawBias      = 0
 	self.SkyProbeDist    = math.max(1200, self.Speed * 6)
-	self.SkyProbeLastHit = 0   -- CurTime() of last sky hit, for cooldown
+	self.SkyProbeLastHit = 0
+
+	-- Obstacle avoidance counters used to rate-limit expensive traces
+	self.ObsLastEval     = 0   -- CurTime() of last full obstacle sweep
+	self.ObsYawBias      = 0   -- separate accumulator so sky & obs can be tuned apart
+	self.ObsAltBias      = 0   -- persistent altitude push from geometry hits
+	self.ObsConsecHits   = 0   -- consecutive ticks with geometry contact (escalation)
 
 	self:Debug("Spawned at " .. tostring(spawnPos) .. " OrbitDir=" .. self.OrbitDir)
 end
@@ -362,37 +373,63 @@ function ENT:Think()
 end
 
 -- ============================================================
--- SKYBOX EVASION
+-- EVASION PROBES
 -- ============================================================
--- Casts 5 probes from current position in the direction of travel:
---   1 forward, 1 left-diagonal, 1 right-diagonal, 1 upward, 1 downward.
--- Any probe that hits sky adds a signed yaw bias and/or altitude correction.
--- The bias is applied to OrbitAngle as extra angular velocity so it
--- integrates smoothly with the existing orbit math instead of snapping.
 --
--- Returns: yawBiasDelta (rad/s to add this tick), altPush (HU upward or 0).
+-- Two separate subsystems share the same yaw-bias accumulator:
+--
+--   1. EvaluateSkyProbes   — fires QuickTrace, checks HitSky.
+--      Handles skybox ceiling, sky-wall to the sides.
+--
+--   2. EvaluateObstacleProbes — fires TraceLine with MASK_SOLID_BRUSHONLY
+--      + prop filter.  Handles buildings, terrain bumps, indoor ceilings,
+--      large props.  Returns a signed yaw nudge AND an altitude push so the
+--      drone can rise over geometry it sees dead ahead.
+--
+-- Both functions return (yawBiasDelta, altPush).
+-- PhysicsUpdate merges them into the shared SkyYawBias accumulator and
+-- the AltDriftTarget.
+-- ============================================================
 
-local SKY_PROBE_DIST_H   = 1400   -- horizontal probe reach (HU)
-local SKY_PROBE_DIST_V   = 900    -- vertical probe reach (HU)
-local SKY_YAW_BIAS_RATE  = 0.35   -- rad/s added per offending horizontal probe
-local SKY_YAW_BIAS_DECAY = 0.88   -- fraction kept each tick (per-tick, NOT per-second)
-local SKY_ALT_PUSH       = 180    -- HU to push AltDriftTarget down when ceiling hit
-local SKY_ALT_RISE       = 120    -- HU to push AltDriftTarget up when floor hit (shouldn't happen but defensive)
+-- ---------- SKY constants ----------
+local SKY_PROBE_DIST_H   = 1400
+local SKY_PROBE_DIST_V   = 900
+local SKY_YAW_BIAS_RATE  = 0.35
+local SKY_YAW_BIAS_DECAY = 0.88
+local SKY_ALT_PUSH       = 180
+local SKY_ALT_RISE       = 120
 
-function ENT:EvaluateSkyProbes(pos, fwdDir)
-	-- Build orthonormal basis from fwdDir (horizontal)
-	local flatFwd = Vector(fwdDir.x, fwdDir.y, 0)
-	if flatFwd:LengthSqr() < 0.01 then flatFwd = Vector(1, 0, 0) end
-	flatFwd:Normalize()
-	local flatRight = Vector(-flatFwd.y, flatFwd.x, 0)  -- 90 deg CW
+-- ---------- OBSTACLE constants ----------
+-- Horizontal probes: how far ahead to look for solid world geometry.
+-- Set relative to speed so faster variants look further.
+local OBS_DIST_FWD     = 900    -- forward probe length (HU)
+local OBS_DIST_SIDE    = 700    -- side diagonal probe length (HU)
+local OBS_DIST_UP      = 500    -- upward probe length (HU)
+local OBS_DIST_DOWN    = 300    -- downward probe length (only for terrain hugging)
+-- How strongly geometry hits push the yaw bias (rad/s)
+local OBS_YAW_RATE     = 0.55   -- per offending horizontal probe
+local OBS_ALT_PUSH_UP  = 250    -- HU: rise when geometry is directly ahead
+local OBS_ALT_PUSH_DN  = 80     -- HU: descend when something is above
+local OBS_YAW_DECAY    = 0.82   -- faster decay than sky so turns are crisp
+local OBS_ALT_DECAY    = 0.90   -- per-tick decay on the altitude bias
+-- Rate-limit: run the full obstacle sweep no more than once every N seconds
+local OBS_EVAL_RATE    = 0.05   -- 20 Hz is plenty; saves ~80% trace calls vs every tick
+-- Proximity urgency: if a hit is closer than this fraction of probe dist, multiply bias
+local OBS_NEAR_FRAC    = 0.45   -- hit within 45 % of probe → double the push
+local OBS_ESCALATE_MAX = 4      -- consecutive-hit count before we inject a hard orbit-reverse
 
-	-- 5 probe endpoints
+-- Trace mask: world brushes + static props + dynamic props
+local OBS_TRACE_MASK = MASK_SOLID_BRUSHONLY
+
+function ENT:EvaluateSkyProbes(pos, flatFwd)
+	local flatRight = Vector(-flatFwd.y, flatFwd.x, 0)
+
 	local probes = {
-		{ dir = flatFwd,                                                       dist = SKY_PROBE_DIST_H,   role = "fwd"   },
-		{ dir = (flatFwd + flatRight * 0.7):GetNormalized(),                   dist = SKY_PROBE_DIST_H,   role = "right" },
-		{ dir = (flatFwd - flatRight * 0.7):GetNormalized(),                   dist = SKY_PROBE_DIST_H,   role = "left"  },
-		{ dir = Vector(flatFwd.x, flatFwd.y,  1):GetNormalized(),              dist = SKY_PROBE_DIST_V,   role = "up"    },
-		{ dir = Vector(flatFwd.x, flatFwd.y, -0.5):GetNormalized(),            dist = SKY_PROBE_DIST_V,   role = "down"  },
+		{ dir = flatFwd,                                             dist = SKY_PROBE_DIST_H, role = "fwd"   },
+		{ dir = (flatFwd + flatRight * 0.7):GetNormalized(),         dist = SKY_PROBE_DIST_H, role = "right" },
+		{ dir = (flatFwd - flatRight * 0.7):GetNormalized(),         dist = SKY_PROBE_DIST_H, role = "left"  },
+		{ dir = Vector(flatFwd.x, flatFwd.y,  1):GetNormalized(),    dist = SKY_PROBE_DIST_V, role = "up"    },
+		{ dir = Vector(flatFwd.x, flatFwd.y, -0.5):GetNormalized(),  dist = SKY_PROBE_DIST_V, role = "down"  },
 	}
 
 	local yawBias = 0
@@ -405,32 +442,115 @@ function ENT:EvaluateSkyProbes(pos, fwdDir)
 		anySky = true
 
 		if p.role == "fwd" then
-			-- Straight ahead: push yaw away from skybox using OrbitDir as bias direction.
-			-- OrbitDir is already the correct turn direction to stay in the orbit arc,
-			-- so amplify it strongly.
 			yawBias = yawBias + SKY_YAW_BIAS_RATE * 2.0 * self.OrbitDir
-
 		elseif p.role == "right" then
-			-- Sky to the right: steer left (negative yaw in GMod convention)
 			yawBias = yawBias - SKY_YAW_BIAS_RATE
-
 		elseif p.role == "left" then
-			-- Sky to the left: steer right
 			yawBias = yawBias + SKY_YAW_BIAS_RATE
-
 		elseif p.role == "up" then
-			-- Hitting the sky ceiling above: push altitude target down
-			-- so AltDrift naturally descends away from it.
 			altPush = altPush - SKY_ALT_PUSH
-
 		elseif p.role == "down" then
-			-- Shouldn't happen in normal maps but handled defensively
 			altPush = altPush + SKY_ALT_RISE
 		end
 	end
 
-	if anySky then
-		self.SkyProbeLastHit = CurTime()
+	if anySky then self.SkyProbeLastHit = CurTime() end
+	return yawBias, altPush
+end
+
+-- ------------------------------------------------------------
+-- EvaluateObstacleProbes
+-- Casts 6 rays against MASK_SOLID_BRUSHONLY to detect world
+-- geometry and large props before they are hit.
+--
+-- Probe layout (all start at current pos):
+--   fwd        — directly ahead, full OBS_DIST_FWD
+--   fwd_near   — same direction, shorter (40%) for close-in detection
+--   right_diag — forward + 0.65 right, OBS_DIST_SIDE
+--   left_diag  — forward − 0.65 right, OBS_DIST_SIDE
+--   up_fwd     — forward + 0.5 up, OBS_DIST_UP (rise over rooftops)
+--   down_fwd   — forward + 0.4 down, OBS_DIST_DOWN (terrain hugging guard)
+--
+-- Returns: (yawBiasDelta, altPush)
+-- ------------------------------------------------------------
+function ENT:EvaluateObstacleProbes(pos, flatFwd)
+	local flatRight = Vector(-flatFwd.y, flatFwd.x, 0)
+
+	-- Build probe table: { dir, dist, role }
+	local probes = {
+		{ dir = flatFwd,                                                     dist = OBS_DIST_FWD,           role = "fwd"       },
+		{ dir = flatFwd,                                                     dist = OBS_DIST_FWD * 0.4,     role = "fwd_near"  },
+		{ dir = (flatFwd + flatRight * 0.65):GetNormalized(),                dist = OBS_DIST_SIDE,          role = "right"     },
+		{ dir = (flatFwd - flatRight * 0.65):GetNormalized(),                dist = OBS_DIST_SIDE,          role = "left"      },
+		{ dir = Vector(flatFwd.x, flatFwd.y, 0.5):GetNormalized(),          dist = OBS_DIST_UP,            role = "up_fwd"    },
+		{ dir = Vector(flatFwd.x, flatFwd.y, -0.4):GetNormalized(),         dist = OBS_DIST_DOWN,          role = "down_fwd"  },
+	}
+
+	local yawBias = 0
+	local altPush = 0
+	local anyHit  = false
+
+	for _, p in ipairs(probes) do
+		local tr = util.TraceLine({
+			start  = pos,
+			endpos = pos + p.dir * p.dist,
+			filter = self,
+			mask   = OBS_TRACE_MASK,
+		})
+
+		-- Only care about solid world/brush hits.  Ignore sky (handled above).
+		if not tr.Hit or tr.HitSky then continue end
+
+		anyHit = true
+
+		-- Proximity multiplier: hits that are close get a stronger push.
+		local fraction = tr.Fraction   -- 0 = right on nose, 1 = far end
+		local urgency  = 1.0
+		if fraction < OBS_NEAR_FRAC then
+			urgency = 2.0
+		end
+
+		if p.role == "fwd" or p.role == "fwd_near" then
+			-- Dead ahead: combine yaw (orbit direction) + altitude rise.
+			-- Magnitude scales with urgency; fwd_near is extra-urgent.
+			local scale = (p.role == "fwd_near") and 1.5 or 1.0
+			yawBias = yawBias + OBS_YAW_RATE * urgency * scale * self.OrbitDir
+			altPush = altPush + OBS_ALT_PUSH_UP * urgency * scale
+
+		elseif p.role == "right" then
+			-- Obstacle to the right: steer left (flip sign of OrbitDir convention)
+			-- Use a raw -1 so it always steers away regardless of orbit direction.
+			yawBias = yawBias - OBS_YAW_RATE * urgency
+
+		elseif p.role == "left" then
+			yawBias = yawBias + OBS_YAW_RATE * urgency
+
+		elseif p.role == "up_fwd" then
+			-- Low overhead clearance: push altitude DOWN slightly and yaw to escape.
+			-- (The drone is about to fly into a ceiling or overhang.)
+			altPush  = altPush  - OBS_ALT_PUSH_DN * urgency
+			yawBias  = yawBias  + OBS_YAW_RATE * 0.5 * urgency * self.OrbitDir
+
+		elseif p.role == "down_fwd" then
+			-- Terrain bump ahead: rise over it.
+			altPush = altPush + OBS_ALT_PUSH_UP * 0.6 * urgency
+		end
+	end
+
+	-- Escalation: if geometry is being continuously hit, increase yaw
+	-- aggressively and optionally flip orbit direction to un-trap the drone.
+	if anyHit then
+		self.ObsConsecHits = (self.ObsConsecHits or 0) + 1
+		if self.ObsConsecHits >= OBS_ESCALATE_MAX then
+			-- Hard escape: reverse orbit direction and inject a large bias pulse.
+			self.OrbitDir      = -self.OrbitDir
+			yawBias            = yawBias + OBS_YAW_RATE * 4.0 * self.OrbitDir
+			self.ObsConsecHits = 0
+			self:Debug("Obstacle escalation — orbit reversed")
+		end
+	else
+		-- Clear tick: decay consecutive counter toward 0 quickly.
+		self.ObsConsecHits = math.max(0, (self.ObsConsecHits or 0) - 1)
 	end
 
 	return yawBias, altPush
@@ -483,34 +603,60 @@ function ENT:PhysicsUpdate(phys)
 		self.BaseCenterPos.z
 	)
 
-	-- ---- Skybox evasion ----
-	-- Evaluate probes using current forward direction.
-	-- yawBiasDelta is in rad/s and added directly to OrbitAngSpeed this tick.
-	-- altPush shifts AltDriftTarget so the normal altitude drift carries
-	-- the drone away from the sky ceiling organically.
-	local fwdDir2D = Angle(0, self.ang.y, 0):Forward()
-	fwdDir2D.z = 0
+	-- ----------------------------------------------------------------
+	-- EVASION EVALUATION
+	-- We run both probe systems every OBS_EVAL_RATE seconds (20 Hz).
+	-- Between evaluations the biases coast on their decay curves, so
+	-- the drone steers smoothly even on high-framerate servers.
+	-- ----------------------------------------------------------------
+	local flatFwd = Angle(0, self.ang.y, 0):Forward()
+	flatFwd.z = 0
+	if flatFwd:LengthSqr() < 0.01 then flatFwd = Vector(1, 0, 0) end
+	flatFwd:Normalize()
 
-	local yawBiasDelta, altPush = self:EvaluateSkyProbes(pos, fwdDir2D)
+	local ct = CurTime()
+	if ct - self.ObsLastEval >= OBS_EVAL_RATE then
+		self.ObsLastEval = ct
 
-	-- Accumulate and decay the persistent yaw bias
-	self.SkyYawBias = (self.SkyYawBias + yawBiasDelta) * SKY_YAW_BIAS_DECAY
-	self.SkyYawBias = math.Clamp(self.SkyYawBias, -1.8, 1.8)   -- cap so it can't spin wildly
+		-- Sky probes: HitSky only
+		local skyYaw, skyAlt = self:EvaluateSkyProbes(pos, flatFwd)
 
-	if altPush ~= 0 then
-		-- Nudge AltDriftTarget away from ceiling/floor, clamped so it stays
-		-- within a reasonable band below self.sky.
-		self.AltDriftTarget = math.Clamp(
-			self.AltDriftTarget + altPush,
-			self.sky - self.AltDriftRange * 2,
-			self.sky
-		)
-		-- Also accelerate the Lerp this tick for a faster initial response
-		self.AltDriftCurrent = Lerp(self.AltDriftLerp * 8, self.AltDriftCurrent, self.AltDriftTarget)
+		-- Obstacle probes: world geometry + props
+		local obsYaw, obsAlt = self:EvaluateObstacleProbes(pos, flatFwd)
+
+		-- Accumulate into separate persistent biases
+		self.SkyYawBias = self.SkyYawBias + skyYaw
+		self.ObsYawBias = self.ObsYawBias + obsYaw
+		self.ObsAltBias = self.ObsAltBias + obsAlt
+
+		-- Altitude corrections: apply nudge to AltDriftTarget
+		local totalAlt = skyAlt + obsAlt
+		if totalAlt ~= 0 then
+			self.AltDriftTarget = math.Clamp(
+				self.AltDriftTarget + totalAlt,
+				self.sky - self.AltDriftRange * 2,
+				self.sky + self.AltDriftRange * 0.5   -- allow a gentle rise above nominal sky
+			)
+			-- Fast-lane the Lerp this tick for a snappy initial response
+			self.AltDriftCurrent = Lerp(self.AltDriftLerp * 10, self.AltDriftCurrent, self.AltDriftTarget)
+		end
 	end
 
-	-- ---- Normal orbit integration (with sky bias blended in) ----
-	self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir + self.SkyYawBias
+	-- Per-tick decay of all bias accumulators
+	self.SkyYawBias = self.SkyYawBias * SKY_YAW_BIAS_DECAY
+	self.ObsYawBias = self.ObsYawBias * OBS_YAW_DECAY
+	self.ObsAltBias = self.ObsAltBias * OBS_ALT_DECAY
+
+	-- Cap so neither system can spin the drone uncontrollably
+	self.SkyYawBias = math.Clamp(self.SkyYawBias, -1.8, 1.8)
+	self.ObsYawBias = math.Clamp(self.ObsYawBias, -2.5, 2.5)  -- obstacles can need a harder turn
+
+	-- Merge both biases into orbit angular speed
+	self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
+	                   + self.SkyYawBias
+	                   + self.ObsYawBias
+
+	-- ---- Normal orbit integration ----
 	self.OrbitAngle = self.OrbitAngle + self.OrbitAngSpeed * dt
 
 	local desiredX = self.CenterPos.x + math.cos(self.OrbitAngle) * self.OrbitRadius
@@ -528,9 +674,9 @@ function ENT:PhysicsUpdate(phys)
 	             + math.sin(self.JitterPhase2) * self.JitterAmp2
 
 	-- Altitude drift
-	if CurTime() >= self.AltDriftNextPick then
+	if ct >= self.AltDriftNextPick then
 		self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
-		self.AltDriftNextPick = CurTime() + math.Rand(10, 25)
+		self.AltDriftNextPick = ct + math.Rand(10, 25)
 	end
 	self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
 	local liveAlt = self.AltDriftCurrent + jitter
@@ -566,7 +712,6 @@ function ENT:PhysicsUpdate(phys)
 	end
 
 	if not self:IsInWorld() then
-		-- Last-resort: teleport back toward center at safe altitude
 		self:Debug("Out of world — center recovery")
 		local safePos = Vector(self.BaseCenterPos.x, self.BaseCenterPos.y, self.sky)
 		self:SetPos(safePos)
