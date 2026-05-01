@@ -191,6 +191,13 @@ function ENT:Initialize()
 	-- Damage tier (0=healthy, 1=light, 2=heavy, 3=dead)
 	self.DamageTier = 0
 
+	-- Skybox evasion state
+	-- SkyYawBias accumulates extra angular velocity when sky probes fire.
+	-- It decays each tick so normal orbit resumes once clear.
+	self.SkyYawBias      = 0
+	self.SkyProbeDist    = math.max(1200, self.Speed * 6)
+	self.SkyProbeLastHit = 0   -- CurTime() of last sky hit, for cooldown
+
 	self:Debug("Spawned at " .. tostring(spawnPos) .. " OrbitDir=" .. self.OrbitDir)
 end
 
@@ -355,6 +362,81 @@ function ENT:Think()
 end
 
 -- ============================================================
+-- SKYBOX EVASION
+-- ============================================================
+-- Casts 5 probes from current position in the direction of travel:
+--   1 forward, 1 left-diagonal, 1 right-diagonal, 1 upward, 1 downward.
+-- Any probe that hits sky adds a signed yaw bias and/or altitude correction.
+-- The bias is applied to OrbitAngle as extra angular velocity so it
+-- integrates smoothly with the existing orbit math instead of snapping.
+--
+-- Returns: yawBiasDelta (rad/s to add this tick), altPush (HU upward or 0).
+
+local SKY_PROBE_DIST_H   = 1400   -- horizontal probe reach (HU)
+local SKY_PROBE_DIST_V   = 900    -- vertical probe reach (HU)
+local SKY_YAW_BIAS_RATE  = 0.35   -- rad/s added per offending horizontal probe
+local SKY_YAW_BIAS_DECAY = 0.88   -- fraction kept each tick (per-tick, NOT per-second)
+local SKY_ALT_PUSH       = 180    -- HU to push AltDriftTarget down when ceiling hit
+local SKY_ALT_RISE       = 120    -- HU to push AltDriftTarget up when floor hit (shouldn't happen but defensive)
+
+function ENT:EvaluateSkyProbes(pos, fwdDir)
+	-- Build orthonormal basis from fwdDir (horizontal)
+	local flatFwd = Vector(fwdDir.x, fwdDir.y, 0)
+	if flatFwd:LengthSqr() < 0.01 then flatFwd = Vector(1, 0, 0) end
+	flatFwd:Normalize()
+	local flatRight = Vector(-flatFwd.y, flatFwd.x, 0)  -- 90 deg CW
+
+	-- 5 probe endpoints
+	local probes = {
+		{ dir = flatFwd,                                                       dist = SKY_PROBE_DIST_H,   role = "fwd"   },
+		{ dir = (flatFwd + flatRight * 0.7):GetNormalized(),                   dist = SKY_PROBE_DIST_H,   role = "right" },
+		{ dir = (flatFwd - flatRight * 0.7):GetNormalized(),                   dist = SKY_PROBE_DIST_H,   role = "left"  },
+		{ dir = Vector(flatFwd.x, flatFwd.y,  1):GetNormalized(),              dist = SKY_PROBE_DIST_V,   role = "up"    },
+		{ dir = Vector(flatFwd.x, flatFwd.y, -0.5):GetNormalized(),            dist = SKY_PROBE_DIST_V,   role = "down"  },
+	}
+
+	local yawBias = 0
+	local altPush = 0
+	local anySky  = false
+
+	for _, p in ipairs(probes) do
+		local tr = util.QuickTrace(pos, p.dir * p.dist, self)
+		if not tr.HitSky then continue end
+		anySky = true
+
+		if p.role == "fwd" then
+			-- Straight ahead: push yaw away from skybox using OrbitDir as bias direction.
+			-- OrbitDir is already the correct turn direction to stay in the orbit arc,
+			-- so amplify it strongly.
+			yawBias = yawBias + SKY_YAW_BIAS_RATE * 2.0 * self.OrbitDir
+
+		elseif p.role == "right" then
+			-- Sky to the right: steer left (negative yaw in GMod convention)
+			yawBias = yawBias - SKY_YAW_BIAS_RATE
+
+		elseif p.role == "left" then
+			-- Sky to the left: steer right
+			yawBias = yawBias + SKY_YAW_BIAS_RATE
+
+		elseif p.role == "up" then
+			-- Hitting the sky ceiling above: push altitude target down
+			-- so AltDrift naturally descends away from it.
+			altPush = altPush - SKY_ALT_PUSH
+
+		elseif p.role == "down" then
+			-- Shouldn't happen in normal maps but handled defensively
+			altPush = altPush + SKY_ALT_RISE
+		end
+	end
+
+	if anySky then
+		self.SkyProbeLastHit = CurTime()
+	end
+
+	return yawBias, altPush
+end
+
+-- ============================================================
 -- FLIGHT
 -- ============================================================
 
@@ -392,6 +474,7 @@ function ENT:PhysicsUpdate(phys)
 	local dt  = FrameTime()
 	if dt <= 0 then dt = 0.01 end
 
+	-- Wander center drift
 	self.WanderPhaseX = self.WanderPhaseX + self.WanderRateX
 	self.WanderPhaseY = self.WanderPhaseY + self.WanderRateY
 	self.CenterPos = Vector(
@@ -400,7 +483,34 @@ function ENT:PhysicsUpdate(phys)
 		self.BaseCenterPos.z
 	)
 
-	self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
+	-- ---- Skybox evasion ----
+	-- Evaluate probes using current forward direction.
+	-- yawBiasDelta is in rad/s and added directly to OrbitAngSpeed this tick.
+	-- altPush shifts AltDriftTarget so the normal altitude drift carries
+	-- the drone away from the sky ceiling organically.
+	local fwdDir2D = Angle(0, self.ang.y, 0):Forward()
+	fwdDir2D.z = 0
+
+	local yawBiasDelta, altPush = self:EvaluateSkyProbes(pos, fwdDir2D)
+
+	-- Accumulate and decay the persistent yaw bias
+	self.SkyYawBias = (self.SkyYawBias + yawBiasDelta) * SKY_YAW_BIAS_DECAY
+	self.SkyYawBias = math.Clamp(self.SkyYawBias, -1.8, 1.8)   -- cap so it can't spin wildly
+
+	if altPush ~= 0 then
+		-- Nudge AltDriftTarget away from ceiling/floor, clamped so it stays
+		-- within a reasonable band below self.sky.
+		self.AltDriftTarget = math.Clamp(
+			self.AltDriftTarget + altPush,
+			self.sky - self.AltDriftRange * 2,
+			self.sky
+		)
+		-- Also accelerate the Lerp this tick for a faster initial response
+		self.AltDriftCurrent = Lerp(self.AltDriftLerp * 8, self.AltDriftCurrent, self.AltDriftTarget)
+	end
+
+	-- ---- Normal orbit integration (with sky bias blended in) ----
+	self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir + self.SkyYawBias
 	self.OrbitAngle = self.OrbitAngle + self.OrbitAngSpeed * dt
 
 	local desiredX = self.CenterPos.x + math.cos(self.OrbitAngle) * self.OrbitRadius
@@ -411,11 +521,13 @@ function ENT:PhysicsUpdate(phys)
 	local yawCorrection = math.Clamp(yawError * 0.08, -0.6, 0.6)
 	self.ang = self.ang + Angle(0, yawCorrection, 0)
 
+	-- Jitter
 	self.JitterPhase  = self.JitterPhase  + self.JitterRate1
 	self.JitterPhase2 = self.JitterPhase2 + self.JitterRate2
 	local jitter = math.sin(self.JitterPhase)  * self.JitterAmp1
 	             + math.sin(self.JitterPhase2) * self.JitterAmp2
 
+	-- Altitude drift
 	if CurTime() >= self.AltDriftNextPick then
 		self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
 		self.AltDriftNextPick = CurTime() + math.Rand(10, 25)
@@ -423,6 +535,7 @@ function ENT:PhysicsUpdate(phys)
 	self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
 	local liveAlt = self.AltDriftCurrent + jitter
 
+	-- Position correction toward orbit ring
 	local posErr = Vector(desiredX - pos.x, desiredY - pos.y, 0)
 	local vel    = self:GetForward() * self.Speed
 	if posErr:LengthSqr() > 400 then
@@ -431,6 +544,7 @@ function ENT:PhysicsUpdate(phys)
 
 	self:SetPos(Vector(pos.x, pos.y, liveAlt))
 
+	-- Roll / pitch smoothing
 	local rawYawDelta = math.NormalizeAngle(self.ang.y - (self.PrevYaw or self.ang.y))
 	self.PrevYaw      = self.ang.y
 
@@ -452,8 +566,15 @@ function ENT:PhysicsUpdate(phys)
 	end
 
 	if not self:IsInWorld() then
-		self:Debug("Out of world — removing")
-		self:Remove()
+		-- Last-resort: teleport back toward center at safe altitude
+		self:Debug("Out of world — center recovery")
+		local safePos = Vector(self.BaseCenterPos.x, self.BaseCenterPos.y, self.sky)
+		self:SetPos(safePos)
+		if IsValid(phys) then phys:SetVelocity(Vector(0,0,0)) end
+		self.OrbitAngle = math.atan2(
+			safePos.y - self.CenterPos.y,
+			safePos.x - self.CenterPos.x
+		)
 	end
 end
 
